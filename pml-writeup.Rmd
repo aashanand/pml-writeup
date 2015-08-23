@@ -1,0 +1,145 @@
+---
+title: "Quantified Self Movement - Prediction of Activity Quality Using Random Forests in R"
+author: "Aash Anand (aashirwad@uchicago.edu)"
+date: "August 23, 2015"
+output: html_document
+---
+
+## Background
+
+Using devices such as *Jawbone Up*, *Nike FuelBand*, and *Fitbit* it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+Our goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website [here](http://groupware.les.inf.puc-rio.br/har) (see the section on the *Weight Lifting Exercise Dataset*). We train a [`Random Forest`](https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm) algorithm in `R` to predict the categorical outcome of how well the activities were performed given accelerometer data.
+
+This exercise has been done as part of the [*Coursera Data Science Specialization*](https://www.coursera.org/specialization/jhudatascience/1), specifically the course in [*Practical Machine Learning*](https://www.coursera.org/course/predmachlearn). Predictions made on the test set were evaluated as a part of this course.
+
+Code within this writeup is meant to be [reproducible](https://en.wikipedia.org/wiki/Literate_programming) given the installation of package dependencies.
+
+## Getting the Data
+We obtain the data in `R` from URLs below:
+
+* A training set of 19,622 observations located [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv).
+* A very small test set of 20 observations located [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv). This dataset is only relevant in the context of the *Coursera* class.
+
+The datasets contain multiple values which should be considered as missing data or `NA` in `R`, including `Microsoft Excel` division-by-zero errors and empty strings.
+
+```{r cache=TRUE}
+train_raw <- url('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv')
+test_raw <- url('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv')
+training <- read.csv(train_raw, na.strings=c("NA","#DIV/0!",""))
+testing <- read.csv(test_raw, na.strings=c("NA","#DIV/0!",""))
+```
+
+## Data Cleanup
+### Incomplete Observations and Feature Selection
+The training set contains `r dim(training)[1]` observations with `r dim(training)[2]` features. A full structural summary of the original dataset can be found in the Appendix. 
+
+Every single observation in the training set contains missing data. 
+```{r}
+sum(complete.cases(training))
+```
+
+Imputation of missing data is ruled out upon examining the split of complete and incomplete features. Out of 160 features in the dataset, 60 are available for all observations. However, the 100 incomplete features are available for less than `r 19622-19216` rows, around 2% of the data. 
+```{r}
+NA_count_by_column <- sapply(training,function(x) sum(is.na(x)))
+table(NA_count_by_column)
+```
+
+Rather than use 2% of complete observations to impute missing data for the remainder of the dataset, we proceed to drop the incomplete features altogether.
+```{r}
+training_with_clean_features <- training[,-NA_count_by_column==0]
+testing_with_clean_features <- testing[,-NA_count_by_column==0]
+```
+
+### Leakage and More Feature Selection
+Our final step in feature-selection involves acknowledging the existence of [leakage](https://www.kaggle.com/wiki/Leakage) in our dataset. Leakage is a term used to describe information in the training set that is out-of-scope and can lead to unrealistic and non-generalizeable predictions by machine learning models. More discussion on identifying and mitigating leakage in data mining can be found in [this paper](http://www.cs.umb.edu/~ding/history/470_670_fall_2011/papers/cs670_Tran_PreferredPaper_LeakingInDataMining.pdf)
+
+The first 7 features in the given training set, which include ID variables and 'bookkeeping' variables used in data-collection, make it trivial for a `Random Forest` model, for example, to achieve near-perfect prediction accuracy without siginificant reliance on the accelerometer measurements.
+
+```{r}
+names(training_with_clean_features)[1:7]
+```
+
+Before we proceed to model-building, we drop these features.
+```{r}
+training_with_clean_features <- training_with_clean_features[,-c(1:7)]
+testing_with_clean_features <- testing_with_clean_features[,-c(1:7)]
+```
+
+## Paralellization
+As an optional step, if reproducing the below code on a desktop or portable device, a parallel backend with multiple cores may be registered using the [`doParallel`](https://cran.r-project.org/web/packages/doParallel/vignettes/gettingstartedParallel.pdf) package. A rule-of-thumb for the `cores` parameter of the `registerDoParallel()` function is half the number of available processor threads. While the code-chunk below can dramatically enhance processing-speed, it carries the risk of memory overflow and the utilization of `SWAP memory`, which would ultimately slow down computation.
+
+```{r}
+library(doParallel,quietly=T)
+registerDoParallel(cores=4) # Please use care in setting the 'cores' parameter
+```
+
+## Outcome variable
+Our `Random Forest` model will ultimately use the 52 remaining features to predict the `classe` variable, which takes categorical values `A`,`B`,`C`,`D` and `E`. The distribution of training observations across the `classe` variable is shown below.
+```{r}
+summary(training_with_clean_features$classe)
+```
+
+## Preliminary Visualization
+While `Random Forest` algorithms can be somewhat hard to interpret or visualize, key predictors can be identified by building a simpler binary classification tree using [`Recursive Partitioning`](https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf) and the `rpart` package. 
+
+```{r cache=TRUE}
+set.seed(1)
+library(rpart)
+library(rpart.plot)
+fit <- rpart(classe~.,data=training_with_clean_features)
+prp(fit)
+```
+
+We expect the variables that appear higher up in this tree-plot to play an important role in our `Random Forest` model - `roll_belt`, `pitch_forearm`, `magnet_dumbbell_y`, to name a few.
+
+## Cross-Validation
+Cross-validation is [deemed unnecessary](http://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#ooberr) by the creators of the `Random Forest` algorithm because of the algorithm's default use of bagging and validation against out-of-bag (oob) samples. Still, we split our training set into training and cross-validation sets using a 70%-30% ratio. This will be useful for feature-selection, model comparison and estimating true out-of-sample error later on.
+
+```{r}
+library(caret,quietly=TRUE)
+set.seed(1)
+in_train <- createDataPartition(training_with_clean_features$classe,p=0.7,list=F)
+training_final <- training_with_clean_features[in_train,]
+training_cv <- training_with_clean_features[-in_train,]
+```
+
+## Model Training Using Caret
+We train our `Random Forest` model using the `train()` function in the `caret` package. We specify `ntree=500` to grow 500 trees and use out-of-bag (oob) resampling.
+
+```{r cache=TRUE}
+set.seed(1)
+library(randomForest,quietly=TRUE)
+rf1 <- train(classe~.,data=training_final,method="rf",
+             trControl=trainControl(method="oob"),ntree=500)
+rf1
+```
+
+## Prediction and Out-of-sample Error
+We apply our `Random Forest` model on the cross-validation set to predict `classe`.
+```{r}
+predict_on_cv <- predict(rf1,training_cv)
+confusionMatrix(training_cv$classe,predict_on_cv)
+```
+Our model achieves 99.56% accuracy on the cross-validation set, meaning that our out-of-sample error is expected to be `1-0.9956`, or 0.44%.
+
+## Importance of Variables
+The `varImpPlot()` function in the `randomForest` package allows us to visualize the importance of variables in predicting outcomes in a given model. It uses the Mean Decrease in the Gini Impurity Index - thus, it measures the mean decrease in impurity each time a node is split on a given variable throughout the forest. The more a variable decreases impurity throughout the forest, the more valuable it is to the model in predicting outcomes.
+
+```{r, fig.height=6}
+varImpPlot(rf1$finalModel,main="Importance of Variables")
+```
+
+As expected, we see that the `roll_belt`, `pitch_forearm` and `magnet_dumbbell_y` variables do play an important role in the final model generated using `Random Forests`. However, there are a number of other important variables that contribute to the model.
+
+## Concluding Notes
+In this exercise, the dataset lent itself to developing a highly accurate model without any feature-building, preprocessing or parameter-selection. In theory, it may be possible to achieve even higher predictive accuracy by employing one or more of these techniques. However, it is also worth considering whether the resources devoted towards achieving these incremental gains are worth the results. In a low-stakes setting, 99.56% accuracy is usually more than acceptable.
+
+Predictions made on the test set for submission to *Coursera* were not reproduced here.
+
+## Appendix
+
+### Data structure
+```{r}
+str(training)
+```
